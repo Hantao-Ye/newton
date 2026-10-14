@@ -2250,6 +2250,15 @@ class SolverCoupledADMM(SolverCoupled):
             return False
         return bool(int(shape_flags[shape]) & int(flag))
 
+    @staticmethod
+    def _worlds_compatible(world_a: int, world_b: int) -> bool:
+        """Same rule as the collision kernels: -1 is global and collides with every world."""
+        return world_a < 0 or world_b < 0 or world_a == world_b
+
+    def _world_ids(self, attr: str) -> np.ndarray | None:
+        arr = getattr(self.model, attr, None)
+        return None if arr is None else arr.numpy()
+
     def _rigid_rigid_spec_shape_pairs(self, spec: _AdmmRigidRigidContactSpec) -> list[tuple[int, int]]:
         if spec.shape_pairs is not None:
             return [(int(a), int(b)) for a, b in spec.shape_pairs]
@@ -3458,7 +3467,19 @@ class SolverCoupledADMM(SolverCoupled):
                 shape_candidates = sorted(shape_filter)
             body_candidates = {int(shape_body[shape]) for shape in shape_candidates if 0 <= shape < len(shape_body)}
 
-            capacity = len(particle_candidates) * len(shape_candidates)
+            # Only world-compatible pairs can ever produce a soft contact (create_soft_contacts skips the
+            # rest), so cross-world pairs must not size the group nor enter the static proximal lump.
+            particle_world = self._world_ids("particle_world")
+            shape_world = self._world_ids("shape_world")
+            pairs = [
+                (int(particle), int(shape))
+                for particle in particle_candidates
+                for shape in shape_candidates
+                if particle_world is None
+                or shape_world is None
+                or self._worlds_compatible(int(particle_world[particle]), int(shape_world[shape]))
+            ]
+            capacity = len(pairs)
             if capacity == 0:
                 continue
             self._require_effective_mass(spec.body_owner, CouplingEndpointKind.BODY)
@@ -3466,12 +3487,11 @@ class SolverCoupledADMM(SolverCoupled):
             body_global_ids = []
             candidate_body_ids = []
             candidate_particle_ids = []
-            for particle in particle_candidates:
-                for shape in shape_candidates:
-                    body = int(shape_body[shape])
-                    body_global_ids.append(body)
-                    candidate_body_ids.append(self._body_local_id(spec.body_owner, body))
-                    candidate_particle_ids.append(int(particle))
+            for particle, shape in pairs:
+                body = int(shape_body[shape])
+                body_global_ids.append(body)
+                candidate_body_ids.append(self._body_local_id(spec.body_owner, body))
+                candidate_particle_ids.append(particle)
             candidate_W = self._compute_interface_weights(
                 body_global_ids,
                 self._admm_buffers[spec.body_owner].body_effective_mass,
@@ -3523,17 +3543,22 @@ class SolverCoupledADMM(SolverCoupled):
         for spec in self._admm_particle_particle_contact_specs:
             particles_a = self._particle_contact_candidates(spec.owner_a, spec.particles_a)
             particles_b = self._particle_contact_candidates(spec.owner_b, spec.particles_b)
-            capacity = len(particles_a) * len(particles_b)
+            # The hash-grid detection skips cross-world particle pairs, so they are not candidates.
+            particle_world = self._world_ids("particle_world")
+            pp_pairs = [
+                (int(particle_a), int(particle_b))
+                for particle_a in particles_a
+                for particle_b in particles_b
+                if particle_world is None
+                or self._worlds_compatible(int(particle_world[particle_a]), int(particle_world[particle_b]))
+            ]
+            capacity = len(pp_pairs)
             if capacity == 0:
                 continue
             self._require_effective_mass(spec.owner_a, CouplingEndpointKind.PARTICLE)
             self._require_effective_mass(spec.owner_b, CouplingEndpointKind.PARTICLE)
-            candidate_particle_ids_a = []
-            candidate_particle_ids_b = []
-            for particle_a in particles_a:
-                for particle_b in particles_b:
-                    candidate_particle_ids_a.append(int(particle_a))
-                    candidate_particle_ids_b.append(int(particle_b))
+            candidate_particle_ids_a = [particle_a for particle_a, _ in pp_pairs]
+            candidate_particle_ids_b = [particle_b for _, particle_b in pp_pairs]
             candidate_W = self._compute_interface_weights(
                 candidate_particle_ids_a,
                 self._admm_buffers[spec.owner_a].particle_effective_mass,

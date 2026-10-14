@@ -356,6 +356,59 @@ def _build_collision_contact_scene() -> tuple[newton.Model, int, int, int]:
     return model, particle, tray_body, tray_shape
 
 
+def _build_multi_world_contact_candidate_solver(world_count: int) -> tuple[newton.Model, SolverCoupledADMM]:
+    """Replicate a falling box and two particle sets, coupled by rigid-particle and particle-particle contacts.
+
+    Worlds are spaced 1 m apart along x, and the box falls between the particles without touching them.
+    All three entries use :class:`SolverSemiImplicit`, which does not support inertial property refresh,
+    so ADMM applies the static proximal lumps accumulated from every contact candidate.
+    """
+    world = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
+    body = world.add_body(
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.3), q=wp.quat_identity()),
+        mass=0.2,
+        inertia=wp.mat33(np.eye(3) * 1.0e-3),
+    )
+    world.add_shape_box(body, hx=0.03, hy=0.03, hz=0.03)
+    for x in (-0.15, -0.05, 0.05, 0.15):
+        world.add_particle(pos=(x, 0.0, 0.0), vel=wp.vec3(), mass=0.01, radius=0.01)
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
+    for world_index in range(world_count):
+        builder.add_world(world, xform=wp.transform(p=wp.vec3(float(world_index), 0.0, 0.0), q=wp.quat_identity()))
+    model = builder.finalize(device="cpu")
+    solver = SolverCoupledADMM(
+        model,
+        [
+            SolverCoupled.Entry(
+                "body",
+                lambda view: SolverSemiImplicit(view, enable_tri_contact=False),
+                bodies=list(range(model.body_count)),
+            ),
+            SolverCoupled.Entry(
+                "a",
+                lambda view: SolverSemiImplicit(view, enable_tri_contact=False),
+                particles=[particle for particle in range(model.particle_count) if particle % 4 < 2],
+            ),
+            SolverCoupled.Entry(
+                "b",
+                lambda view: SolverSemiImplicit(view, enable_tri_contact=False),
+                particles=[particle for particle in range(model.particle_count) if particle % 4 >= 2],
+            ),
+        ],
+        SolverCoupledADMM.Config(
+            iterations=2,
+            rho=50.0,
+            gamma=0.1,
+            contact_pairs=[
+                SolverCoupledADMM.ContactPair(source="body", destination="a"),
+                SolverCoupledADMM.ContactPair(source="a", destination="b"),
+            ],
+        ),
+    )
+    return model, solver
+
+
 def _run_body_particle(solver, model: newton.Model, n_steps: int = 4, dt: float = 1.0 / 60.0):
     state_0 = model.state()
     state_1 = model.state()
@@ -1392,6 +1445,55 @@ class TestAdmmCollisionDetection(unittest.TestCase):
                     contact_pairs=[SolverCoupledADMM.ContactPair(source="a", destination="b")],
                 ),
             )
+
+    def test_collision_contact_candidates_are_world_local(self):
+        """Size contact candidates and static proximal lumps per world, independent of the world count.
+
+        Rigid-particle and particle-particle contacts are detected only between compatible worlds, so
+        candidates in other worlds must neither enlarge a contact group nor add proximal mass to an entity.
+        """
+        _, solver_1 = _build_multi_world_contact_candidate_solver(1)
+        _, solver_3 = _build_multi_world_contact_candidate_solver(3)
+
+        for kind, groups_1, groups_3 in (
+            ("rigid-particle", solver_1._admm_dynamic_rp_contact_groups, solver_3._admm_dynamic_rp_contact_groups),
+            ("particle-particle", solver_1._admm_dynamic_pp_contact_groups, solver_3._admm_dynamic_pp_contact_groups),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(len(groups_1), 1)
+                self.assertEqual(len(groups_3), 1)
+                self.assertEqual(groups_3[0].capacity, 3 * groups_1[0].capacity)
+
+        body_lump_1 = solver_1._admm_buffers["body"].body_proximal_mass.numpy()
+        self.assertTrue(np.all(body_lump_1 > 0.0))
+        np.testing.assert_allclose(
+            solver_3._admm_buffers["body"].body_proximal_mass.numpy(), np.tile(body_lump_1, 3), rtol=1.0e-6
+        )
+        for name in ("a", "b"):
+            with self.subTest(entry=name):
+                particle_lump_1 = solver_1._admm_buffers[name].particle_proximal_mass.numpy()
+                self.assertGreater(float(np.max(particle_lump_1)), 0.0)
+                np.testing.assert_allclose(
+                    solver_3._admm_buffers[name].particle_proximal_mass.numpy(),
+                    np.tile(particle_lump_1, 3),
+                    rtol=1.0e-6,
+                )
+
+    def test_static_proximal_lump_does_not_depend_on_world_count(self):
+        """Simulate each replicated world exactly like a single-world model."""
+        model_1, solver_1 = _build_multi_world_contact_candidate_solver(1)
+        model_3, solver_3 = _build_multi_world_contact_candidate_solver(3)
+
+        body_q_1, particle_q_1 = _run_body_particle(solver_1, model_1, n_steps=30)
+        body_q_3, particle_q_3 = _run_body_particle(solver_3, model_3, n_steps=30)
+
+        # World i is the single world translated by i along x.
+        expected_body_q = np.tile(body_q_1, (3, 1))
+        expected_body_q[:, 0] += np.arange(3)
+        expected_particle_q = np.tile(particle_q_1, (3, 1))
+        expected_particle_q[:, 0] += np.repeat(np.arange(3), model_1.particle_count)
+        np.testing.assert_allclose(body_q_3, expected_body_q, atol=1.0e-6)
+        np.testing.assert_allclose(particle_q_3, expected_particle_q, atol=1.0e-6)
 
     def test_collision_particle_particle_contacts_are_refreshed_in_solver(self):
         model = _build_two_particle_contact_scene(gap=-0.08)

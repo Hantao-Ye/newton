@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import warnings
 from collections.abc import Sequence
@@ -22,6 +23,16 @@ from .admm_contact_stream import (
     AdmmContactType,
     admm_contact_stream_reset_count_kernel,
     admm_contact_stream_update_normal_force_kernel,
+)
+from .admm_feature_contact import (
+    contact_ef_accumulate_forces_kernel,
+    contact_ef_clear_buffer_kernel,
+    contact_ef_compute_Jv_kernel,
+    contact_ef_compute_u_min_kernel,
+    contact_ef_fill_kernel,
+    contact_ef_map_pairs_kernel,
+    contact_ef_store_clear_kernel,
+    contact_ef_store_write_kernel,
 )
 from .admm_utils import (
     accumulate_active_body_contact_proximal_lump_kernel,
@@ -377,6 +388,77 @@ class _AdmmParticleParticleContactGroup:
         return self.capacity if self.capacity is not None else self.particle_ids_a.shape[0]
 
 
+@dataclass
+class _AdmmFeatureContactBuffer:
+    """Edge/face soft-contact records of one full-surface group, in the layout of :class:`newton.Contacts`.
+
+    Filled by :func:`newton._src.geometry.soft_contacts_sdf.launch_soft_ef_contacts`, which reads the
+    ``soft_contact_*`` attributes by name.
+    """
+
+    soft_contact_max: int
+    soft_contact_count: wp.array
+    soft_contact_tids: wp.array
+    soft_contact_particle: wp.array
+    soft_contact_indices: wp.array
+    soft_contact_barycentric: wp.array
+    soft_contact_shape: wp.array
+    soft_contact_body_pos: wp.array
+    soft_contact_body_vel: wp.array
+    soft_contact_normal: wp.array
+
+
+@dataclass
+class _AdmmRigidSoftFeatureContactGroup:
+    """Rigid-body to soft edge/face ADMM contact group for one owner pair (full-surface contact).
+
+    Rows ``[0, active_count)`` couple a body point to a barycentric point of a soft edge or triangle
+    (``corners`` -1 padded, ``bary`` their weights). ``edge_pairs`` and ``face_pairs`` are the
+    world-compatible (feature, shape) candidates; a candidate's index in their concatenation is its
+    warm-start key (``pair_ids``, ``store_*``).
+    """
+
+    body_entry_name: str
+    particle_entry_name: str
+    edge_pairs: wp.array
+    face_pairs: wp.array
+    buffer: _AdmmFeatureContactBuffer
+    contact_pair: wp.array
+    body_ids: wp.array
+    point_body: wp.array
+    corners: wp.array
+    bary: wp.array
+    particle_ids: wp.array
+    shape_ids: wp.array
+    pair_ids: wp.array
+    normal: wp.array
+    W: wp.array
+    friction: wp.array
+    u: wp.array
+    lambda_: wp.array
+    Jv: wp.array
+    u_min: wp.array
+    capacity: int
+    active_count: wp.array
+    active_count_max: wp.array
+    record_count_max: wp.array
+    filtered_count: wp.array
+    store_active: wp.array
+    store_W: wp.array
+    store_lambda: wp.array
+    prev_pair: wp.array
+    prev_count: wp.array
+    redundancy_tolerance: float | None
+
+    @property
+    def count(self) -> int:
+        return self.capacity
+
+    @property
+    def pair_count(self) -> int:
+        return self.edge_pairs.shape[0] + self.face_pairs.shape[0]
+
+
 @dataclass(frozen=True)
 class _AdmmRigidParticleContactSpec:
     """Internal particle-shape contact source derived from model ownership."""
@@ -384,6 +466,7 @@ class _AdmmRigidParticleContactSpec:
     particle_owner: str
     body_owner: str
     shapes: tuple[int, ...] | None = None
+    full_surface: bool = False
 
 
 @dataclass(frozen=True)
@@ -595,10 +678,21 @@ class SolverCoupledADMM(SolverCoupled):
             source: Name of one solver entry.
             destination: Name of the other solver entry. Must differ from
                 ``source``.
+            full_surface: Also couple the rigid shapes against the edges and
+                triangle interiors of the particle entry's soft meshes, not only
+                against its particles. Each edge/face contact becomes an ADMM row
+                whose impulse is distributed over the feature's particles by
+                barycentric weight. This catches rigid features that pass between
+                particles (e.g. a thin pad through a coarse cloth cell). Only
+                shapes that can generate full-surface contact take part (analytic
+                primitives, infinite planes, and mesh/convex shapes with an SDF);
+                the others keep per-particle rows only. Requires ``gamma == 0``.
+                Defaults to ``False``.
         """
 
         source: str
         destination: str
+        full_surface: bool = field(default=False, kw_only=True)
 
     @dataclass(frozen=True)
     class Config:
@@ -684,6 +778,28 @@ class SolverCoupledADMM(SolverCoupled):
         ``None`` preserves the :class:`CollisionPipeline` default.
         """
 
+        full_surface_contact_max: int | None = field(default=None, kw_only=True)
+        """Row capacity of each full-surface (edge/face) contact group.
+
+        Must be positive. ``None`` sizes each group for every world-compatible
+        (soft edge or triangle, shape) candidate pair, which never overflows.
+        Records beyond the capacity are dropped (see the group's
+        ``record_count_max``).
+        """
+
+        full_surface_redundancy_tolerance: float | None = field(default=5.0e-4, kw_only=True)
+        """Distance [m] below which an edge/face contact counts as implied by its particles' rows.
+
+        A full-surface record at the soft point ``x = sum_a w_a x_a`` is dropped
+        when ``phi(x) >= sum_a w_a phi(x_a) - tolerance``, ``phi`` being the
+        shape's signed distance. For a convex shape this holds with equality
+        where the distance is affine over the feature (a flat face under it),
+        where the particles' own rows already enforce the gap; records remain
+        where a shape edge or corner reaches into the feature between its
+        particles. Must be finite and nonnegative. ``None`` keeps every record,
+        so flat contact is also represented by edge and face rows.
+        """
+
     def __init__(
         self,
         model: Model,
@@ -699,6 +815,7 @@ class SolverCoupledADMM(SolverCoupled):
         self._admm_dynamic_rr_contact_groups: list[_AdmmRigidRigidContactGroup] = []
         self._admm_dynamic_rp_contact_groups: list[_AdmmRigidParticleContactGroup] = []
         self._admm_dynamic_pp_contact_groups: list[_AdmmParticleParticleContactGroup] = []
+        self._admm_dynamic_ef_contact_groups: list[_AdmmRigidSoftFeatureContactGroup] = []
         self._admm_rigid_particle_contact_specs: list[_AdmmRigidParticleContactSpec] = []
         self._admm_rigid_rigid_contact_specs: list[_AdmmRigidRigidContactSpec] = []
         self._admm_particle_particle_contact_specs: list[_AdmmParticleParticleContactSpec] = []
@@ -779,6 +896,20 @@ class SolverCoupledADMM(SolverCoupled):
                 "ADMM contact_matching_normal_dot_threshold",
                 lower_bound=-1.0,
                 upper_bound=1.0,
+            )
+        if coupling.full_surface_contact_max is not None:
+            cls._positive_integer(coupling.full_surface_contact_max, "ADMM full_surface_contact_max")
+        if coupling.full_surface_redundancy_tolerance is not None:
+            cls._finite_scalar(
+                coupling.full_surface_redundancy_tolerance,
+                "ADMM full_surface_redundancy_tolerance",
+                lower_bound=0.0,
+            )
+        if float(coupling.gamma) > 0.0 and any(getattr(pair, "full_surface", False) for pair in coupling.contact_pairs):
+            raise ValueError(
+                "ADMM full-surface contact pairs do not support gamma > 0 yet: their candidate edge/face rows "
+                "would enter the static proximal lump of entries without inertial refresh. Use gamma = 0 or "
+                "full_surface=False."
             )
 
     @staticmethod
@@ -1029,6 +1160,7 @@ class SolverCoupledADMM(SolverCoupled):
             self._admm_dynamic_rr_contact_groups,
             self._admm_dynamic_rp_contact_groups,
             self._admm_dynamic_pp_contact_groups,
+            self._admm_dynamic_ef_contact_groups,
         ):
             for group in groups:
                 counter = getattr(group, attr)
@@ -1168,6 +1300,8 @@ class SolverCoupledADMM(SolverCoupled):
             )
             if self._admm_rigid_particle_contact_specs:
                 self._admm_dynamic_rp_contact_groups = self._build_collision_rigid_particle_contact_groups()
+                if any(spec.full_surface for spec in self._admm_rigid_particle_contact_specs):
+                    self._admm_dynamic_ef_contact_groups = self._build_collision_feature_contact_groups()
 
         if self._admm_particle_particle_contact_specs:
             self._validate_particle_particle_contact_specs()
@@ -1874,6 +2008,8 @@ class SolverCoupledADMM(SolverCoupled):
             *self._admm_dynamic_pp_contact_groups,
         ):
             self._zero_group_reset_arrays(group)
+        for group in self._admm_dynamic_ef_contact_groups:
+            self._zero_feature_group_reset_arrays(group)
 
         if self._admm_internal_contacts is not None:
             self._admm_internal_contacts.clear(bump_generation=True)
@@ -1894,7 +2030,11 @@ class SolverCoupledADMM(SolverCoupled):
             entry_a = self._entries[group.body_entry_name_a]
             entry_b = self._entries[group.body_entry_name_b]
             rows.append((group, group.body_ids_a, entry_a.view.body_world, group.body_ids_b, entry_b.view.body_world))
-        for group in (*self._admm_rp_groups, *self._admm_dynamic_rp_contact_groups):
+        for group in (
+            *self._admm_rp_groups,
+            *self._admm_dynamic_rp_contact_groups,
+            *self._admm_dynamic_ef_contact_groups,
+        ):
             body_entry = self._entries[group.body_entry_name]
             particle_entry = self._entries[group.particle_entry_name]
             rows.append(
@@ -1935,6 +2075,22 @@ class SolverCoupledADMM(SolverCoupled):
                 ],
                 device=self.model.device,
             )
+
+    @classmethod
+    def _zero_feature_group_reset_arrays(cls, group: _AdmmRigidSoftFeatureContactGroup) -> None:
+        for array in (
+            group.u,
+            group.lambda_,
+            group.Jv,
+            group.u_min,
+            group.active_count,
+            group.active_count_max,
+            group.record_count_max,
+            group.filtered_count,
+            group.store_active,
+            group.prev_count,
+        ):
+            cls._zero_array(array)
 
     @staticmethod
     def _zero_array(array) -> None:
@@ -2211,6 +2367,23 @@ class SolverCoupledADMM(SolverCoupled):
         self._admm_rigid_particle_contact_specs = [
             spec for spec in rp_specs if matching_pair(spec.body_owner, spec.particle_owner) is not None
         ]
+        full_surface_owner_pairs = {key for key, pair in pair_by_owners.items() if pair.full_surface}
+        if full_surface_owner_pairs:
+            self._admm_rigid_particle_contact_specs = [
+                dataclasses.replace(spec, full_surface=True)
+                if frozenset({spec.body_owner, spec.particle_owner}) in full_surface_owner_pairs
+                else spec
+                for spec in self._admm_rigid_particle_contact_specs
+            ]
+            covered = {
+                frozenset({spec.body_owner, spec.particle_owner}) for spec in self._admm_rigid_particle_contact_specs
+            }
+            for key in full_surface_owner_pairs - covered:
+                pair = pair_by_owners[key]
+                raise ValueError(
+                    f"ADMM ContactPair({pair.source!r}, {pair.destination!r}, full_surface=True) needs one entry "
+                    "owning particles and the other owning shapes that collide with particles"
+                )
         self._admm_rigid_rigid_contact_specs = [
             spec for spec in rr_specs if matching_pair(spec.owner_a, spec.owner_b) is not None
         ]
@@ -3249,6 +3422,9 @@ class SolverCoupledADMM(SolverCoupled):
                     device=self.model.device,
                 )
 
+        for group in self._admm_dynamic_ef_contact_groups:
+            self._refresh_feature_contact_group(group, state_in)
+
         if self._admm_dynamic_pp_contact_groups:
             with wp.ScopedDevice(self.model.device):
                 self.model.particle_grid.build(
@@ -3357,6 +3533,119 @@ class SolverCoupledADMM(SolverCoupled):
                 ],
                 device=self.model.device,
             )
+
+    def _refresh_feature_contact_group(self, group: _AdmmRigidSoftFeatureContactGroup, state_in: State) -> None:
+        """Detect a full-surface group's edge/face contacts on ``state_in`` and rebuild its rows.
+
+        Runs after the internal pipeline's ``collide`` on the same state, whose shape bounds the
+        edge/face passes reuse for their broad rejection. Graph-capture safe: fixed launch sizes, no
+        host reads.
+        """
+        from ...geometry.soft_contacts_sdf import launch_soft_ef_contacts  # noqa: PLC0415
+
+        device = self.model.device
+        body_entry = self._entries[group.body_entry_name]
+        body_buf = self._admm_buffers[group.body_entry_name]
+        particle_buf = self._admm_buffers[group.particle_entry_name]
+        buffer = group.buffer
+        # Keep the rows of the step that just ended, by candidate pair, for this fill's warm start.
+        wp.launch(
+            contact_ef_store_clear_kernel,
+            dim=group.capacity,
+            inputs=[group.prev_count, group.prev_pair],
+            outputs=[group.store_active],
+            device=device,
+        )
+        wp.launch(
+            contact_ef_store_write_kernel,
+            dim=group.capacity,
+            inputs=[group.active_count, group.pair_ids, group.W, group.lambda_],
+            outputs=[group.store_active, group.store_W, group.store_lambda, group.prev_pair, group.prev_count],
+            device=device,
+        )
+        group.active_count.zero_()
+        group.filtered_count.zero_()
+        wp.launch(
+            contact_ef_clear_buffer_kernel,
+            dim=group.pair_count,
+            inputs=[],
+            outputs=[buffer.soft_contact_count, buffer.soft_contact_tids],
+            device=device,
+        )
+        pipeline = self._admm_collision_pipeline
+        use_bounds = not pipeline.requires_grad
+        launch_soft_ef_contacts(
+            model=self.model,
+            state=state_in,
+            contacts=buffer,
+            margin=float(pipeline.soft_contact_gap),
+            device=device,
+            edge_pairs=group.edge_pairs,
+            face_pairs=group.face_pairs,
+            n_particle_pairs=0,
+            shape_aabb_lower=pipeline.narrow_phase.shape_aabb_lower if use_bounds else None,
+            shape_aabb_upper=pipeline.narrow_phase.shape_aabb_upper if use_bounds else None,
+        )
+        wp.launch(
+            contact_ef_map_pairs_kernel,
+            dim=group.pair_count,
+            inputs=[buffer.soft_contact_tids, buffer.soft_contact_max],
+            outputs=[group.contact_pair],
+            device=device,
+        )
+        tolerance = group.redundancy_tolerance
+        wp.launch(
+            contact_ef_fill_kernel,
+            dim=group.capacity,
+            inputs=[
+                buffer.soft_contact_count,
+                buffer.soft_contact_max,
+                buffer.soft_contact_indices,
+                buffer.soft_contact_barycentric,
+                buffer.soft_contact_shape,
+                buffer.soft_contact_body_pos,
+                buffer.soft_contact_normal,
+                group.contact_pair,
+                0 if tolerance is None else 1,
+                0.0 if tolerance is None else float(tolerance),
+                self.model.particle_flags,
+                state_in.particle_q,
+                state_in.body_q,
+                self.model.shape_transform,
+                self.model.shape_body,
+                self.model.shape_type,
+                self.model.shape_scale,
+                self.model._shape_sdf_index,
+                self.model._texture_sdf_data,
+                body_entry.body_global_to_local,
+                body_buf.body_effective_mass,
+                particle_buf.particle_effective_mass,
+                self.model.shape_material_mu,
+                float(self.model.particle_mu),
+                group.store_active,
+                group.store_W,
+                group.store_lambda,
+                int(group.capacity),
+                group.active_count,
+                group.active_count_max,
+                group.record_count_max,
+                group.filtered_count,
+            ],
+            outputs=[
+                group.body_ids,
+                group.point_body,
+                group.corners,
+                group.bary,
+                group.particle_ids,
+                group.shape_ids,
+                group.pair_ids,
+                group.normal,
+                group.W,
+                group.friction,
+                group.lambda_,
+            ],
+            device=device,
+        )
 
     def _make_int_mask_array(self, count: int, indices: set[int]) -> wp.array:
         device = self.model.device
@@ -3534,6 +3823,144 @@ class SolverCoupledADMM(SolverCoupled):
                 )
             )
 
+        return groups
+
+    def _feature_shape_pairs(
+        self,
+        features: np.ndarray,
+        owned_particles: np.ndarray,
+        particle_world: np.ndarray,
+        shape_world: np.ndarray,
+        shape_ok: np.ndarray,
+    ) -> np.ndarray:
+        """World-compatible ``(feature, shape)`` pairs whose feature corners all belong to the particle owner.
+
+        ``features`` holds each feature's corner particles (an edge's two endpoints, a triangle's three
+        vertices). A feature's world is its first corner's, as in the collision pipeline's full-surface
+        candidates, and the world rule is :func:`_world_compatible_pairs`'s.
+        """
+        from ...sim.collide import _world_compatible_pairs  # noqa: PLC0415
+
+        if features.shape[0] == 0 or not shape_ok.any():
+            return np.empty((0, 2), dtype=np.int32)
+        pairs = _world_compatible_pairs(
+            particle_world[features[:, 0]],
+            shape_world,
+            int(self.model.world_count),
+            "cpu",
+            shape_ok=shape_ok,
+        ).numpy()
+        if pairs.shape[0] == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        feature_owned = owned_particles[features].all(axis=1)
+        return np.ascontiguousarray(pairs[feature_owned[pairs[:, 0]]], dtype=np.int32)
+
+    def _build_collision_feature_contact_groups(self) -> list[_AdmmRigidSoftFeatureContactGroup]:
+        """Build the full-surface (edge/face) contact groups of the rigid-particle specs that ask for them."""
+        from ...sim.collide import _full_surface_capable_shape_mask  # noqa: PLC0415
+
+        model = self.model
+        device = model.device
+        groups: list[_AdmmRigidSoftFeatureContactGroup] = []
+        if model.shape_count == 0:
+            return groups
+        shape_body = model.shape_body.numpy()
+        capable = _full_surface_capable_shape_mask(model)
+        particle_world = self._world_ids("particle_world")
+        if particle_world is None:
+            particle_world = np.full(model.particle_count, -1, dtype=np.int32)
+        shape_world = self._world_ids("shape_world")
+        if shape_world is None:
+            shape_world = np.full(model.shape_count, -1, dtype=np.int32)
+        edge_count = int(getattr(model, "edge_count", 0) or 0)
+        tri_count = int(getattr(model, "tri_count", 0) or 0)
+        # edge_indices rows are [o0, o1, v0, v1]; the endpoints are columns 2 and 3.
+        edges = model.edge_indices.numpy()[:, 2:4].astype(np.int64) if edge_count else np.empty((0, 2), np.int64)
+        tris = model.tri_indices.numpy().astype(np.int64) if tri_count else np.empty((0, 3), np.int64)
+        labels = getattr(model, "shape_label", None)
+
+        for spec_idx, spec in enumerate(self._admm_rigid_particle_contact_specs):
+            if not spec.full_surface:
+                continue
+            shape_filter = self._admm_rigid_particle_shape_filters.get(spec_idx)
+            if shape_filter is None:
+                owner_bodies = self._entry_body_sets[spec.body_owner]
+                shape_candidates = [
+                    shape for shape in range(model.shape_count) if int(shape_body[shape]) in owner_bodies
+                ]
+            else:
+                shape_candidates = sorted(shape_filter)
+            fallback = [shape for shape in shape_candidates if not capable[shape]]
+            if fallback:
+                names = [labels[i] if labels is not None and i < len(labels) else f"shape {i}" for i in fallback]
+                shown = ", ".join(str(name) for name in names[:5]) + (", ..." if len(names) > 5 else "")
+                warnings.warn(
+                    f"ADMM full-surface contact between {spec.body_owner!r} and {spec.particle_owner!r}: "
+                    f"{len(fallback)} shape(s) cannot generate edge/face contacts (no SDF, or an unsupported "
+                    f"type) and keep per-particle contact only: {shown}",
+                    stacklevel=3,
+                )
+            shape_ok = np.zeros(model.shape_count, dtype=bool)
+            shape_ok[[shape for shape in shape_candidates if capable[shape]]] = True
+            owned = np.zeros(model.particle_count, dtype=bool)
+            owned[sorted(self._entry_particle_sets[spec.particle_owner])] = True
+            edge_pairs = self._feature_shape_pairs(edges, owned, particle_world, shape_world, shape_ok)
+            face_pairs = self._feature_shape_pairs(tris, owned, particle_world, shape_world, shape_ok)
+            pair_count = edge_pairs.shape[0] + face_pairs.shape[0]
+            if pair_count == 0:
+                continue
+            self._require_effective_mass(spec.body_owner, CouplingEndpointKind.BODY)
+            self._require_effective_mass(spec.particle_owner, CouplingEndpointKind.PARTICLE)
+            cap = self._coupling.full_surface_contact_max
+            capacity = pair_count if cap is None else min(int(cap), pair_count)
+
+            buffer = _AdmmFeatureContactBuffer(
+                soft_contact_max=capacity,
+                soft_contact_count=wp.zeros(1, dtype=int, device=device),
+                soft_contact_tids=wp.full(pair_count, -1, dtype=int, device=device),
+                soft_contact_particle=wp.full(capacity, -1, dtype=int, device=device),
+                soft_contact_indices=wp.full(capacity, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=device),
+                soft_contact_barycentric=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                soft_contact_shape=wp.full(capacity, -1, dtype=int, device=device),
+                soft_contact_body_pos=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                soft_contact_body_vel=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                soft_contact_normal=wp.zeros(capacity, dtype=wp.vec3, device=device),
+            )
+            groups.append(
+                _AdmmRigidSoftFeatureContactGroup(
+                    body_entry_name=spec.body_owner,
+                    particle_entry_name=spec.particle_owner,
+                    edge_pairs=wp.array(edge_pairs.reshape(-1, 2), dtype=wp.vec2i, device=device),
+                    face_pairs=wp.array(face_pairs.reshape(-1, 2), dtype=wp.vec2i, device=device),
+                    buffer=buffer,
+                    contact_pair=wp.full(capacity, -1, dtype=int, device=device),
+                    body_ids=wp.zeros(capacity, dtype=int, device=device),
+                    point_body=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                    corners=wp.full(capacity, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=device),
+                    bary=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                    particle_ids=wp.full(capacity, -1, dtype=int, device=device),
+                    shape_ids=wp.full(capacity, -1, dtype=int, device=device),
+                    pair_ids=wp.full(capacity, -1, dtype=int, device=device),
+                    normal=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                    W=wp.zeros(capacity, dtype=float, device=device),
+                    friction=wp.zeros(capacity, dtype=float, device=device),
+                    u=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                    lambda_=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                    Jv=wp.zeros(capacity, dtype=wp.vec3, device=device),
+                    u_min=wp.zeros(capacity, dtype=float, device=device),
+                    capacity=capacity,
+                    active_count=wp.zeros(1, dtype=int, device=device),
+                    active_count_max=wp.zeros(1, dtype=int, device=device),
+                    record_count_max=wp.zeros(1, dtype=int, device=device),
+                    filtered_count=wp.zeros(1, dtype=int, device=device),
+                    store_active=wp.zeros(pair_count, dtype=int, device=device),
+                    store_W=wp.zeros(pair_count, dtype=float, device=device),
+                    store_lambda=wp.zeros(pair_count, dtype=wp.vec3, device=device),
+                    prev_pair=wp.full(capacity, -1, dtype=int, device=device),
+                    prev_count=wp.zeros(1, dtype=int, device=device),
+                    redundancy_tolerance=self._coupling.full_surface_redundancy_tolerance,
+                )
+            )
         return groups
 
     def _build_collision_particle_particle_contact_groups(self) -> list[_AdmmParticleParticleContactGroup]:
@@ -3744,6 +4171,28 @@ class SolverCoupledADMM(SolverCoupled):
                     group.particle_ids,
                     group.normal,
                     group.body_sign,
+                    body_entry.state_0.body_q,
+                    particle_entry.state_0.particle_q,
+                    self.model.particle_radius,
+                    float(coupling.baumgarte),
+                    float(dt),
+                ],
+                outputs=[group.u_min],
+                device=self.model.device,
+            )
+        for group in self._admm_dynamic_ef_contact_groups:
+            body_entry = self._entries[group.body_entry_name]
+            particle_entry = self._entries[group.particle_entry_name]
+            wp.launch(
+                contact_ef_compute_u_min_kernel,
+                dim=group.count,
+                inputs=[
+                    group.active_count,
+                    group.body_ids,
+                    group.point_body,
+                    group.corners,
+                    group.bary,
+                    group.normal,
                     body_entry.state_0.body_q,
                     particle_entry.state_0.particle_q,
                     self.model.particle_radius,
@@ -4274,6 +4723,50 @@ class SolverCoupledADMM(SolverCoupled):
                 outputs=[body_buf.body_f, particle_buf.particle_f],
                 device=self.model.device,
             )
+        for group in self._admm_dynamic_ef_contact_groups:
+            body_entry = self._entries[group.body_entry_name]
+            body_buf = self._admm_buffers[group.body_entry_name]
+            particle_buf = self._admm_buffers[group.particle_entry_name]
+            if refresh_jv:
+                wp.launch(
+                    contact_ef_compute_Jv_kernel,
+                    dim=group.count,
+                    inputs=[
+                        group.active_count,
+                        group.body_ids,
+                        group.point_body,
+                        group.corners,
+                        group.bary,
+                        body_entry.state_0.body_q,
+                        body_entry.view.body_com,
+                        body_buf.body_qd_k,
+                        particle_buf.particle_qd_k,
+                    ],
+                    outputs=[group.Jv],
+                    device=self.model.device,
+                )
+            if initialize_contact_u:
+                self._update_admm_contact_u(group)
+            wp.launch(
+                contact_ef_accumulate_forces_kernel,
+                dim=group.count,
+                inputs=[
+                    group.active_count,
+                    group.body_ids,
+                    group.point_body,
+                    group.corners,
+                    group.bary,
+                    body_entry.state_0.body_q,
+                    body_entry.view.body_com,
+                    float(coupling.rho),
+                    group.W,
+                    group.lambda_,
+                    group.u,
+                    group.Jv,
+                ],
+                outputs=[body_buf.body_f, particle_buf.particle_f],
+                device=self.model.device,
+            )
         for group in self._admm_dynamic_pp_contact_groups:
             if group.count == 0:
                 continue
@@ -4489,6 +4982,27 @@ class SolverCoupledADMM(SolverCoupled):
                     group.point_body,
                     group.particle_ids,
                     group.body_sign,
+                    body_entry.state_0.body_q,
+                    body_entry.view.body_com,
+                    body_entry.state_1.body_qd,
+                    particle_entry.state_1.particle_qd,
+                ],
+                outputs=[group.Jv],
+                device=self.model.device,
+            )
+            self._update_admm_contact_dual(group)
+        for group in self._admm_dynamic_ef_contact_groups:
+            body_entry = self._entries[group.body_entry_name]
+            particle_entry = self._entries[group.particle_entry_name]
+            wp.launch(
+                contact_ef_compute_Jv_kernel,
+                dim=group.count,
+                inputs=[
+                    group.active_count,
+                    group.body_ids,
+                    group.point_body,
+                    group.corners,
+                    group.bary,
                     body_entry.state_0.body_q,
                     body_entry.view.body_com,
                     body_entry.state_1.body_qd,

@@ -1665,5 +1665,417 @@ class TestAdmmCollisionDetection(unittest.TestCase):
         self.assertLess(final_tray_z, initial_tray_z - 1.0e-3)
 
 
+# ----------------------------------------------------------------------
+# Full-surface (edge/face) rigid-soft contact rows
+# ----------------------------------------------------------------------
+
+_PAD_HALF = (0.011, 0.004, 0.010)  # a gripper-pad-sized box [m]
+
+
+def _pad_cloth_world(
+    *,
+    gravity: float = -10.0,
+    particle_mass: float = 0.0,
+    box_xy: tuple[float, float] = (0.07, 0.03),
+    box_bottom: float = 0.002,
+    box_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    box_mass: float = 0.05,
+    cells: tuple[int, int] = (1, 1),
+    mu: float = 1.0,
+    box_half: tuple[float, float, float] = _PAD_HALF,
+    box_inertia: float | None = None,
+) -> tuple[newton.ModelBuilder, int]:
+    """A 0.1 m-cell cloth (radius 3 mm) in the z = 0 plane and a box (pad-sized by default) above it.
+
+    With the default box position the box's footprint covers no cloth vertex: it lies across the
+    diagonal edge of a 0.1 m cell, so only edge/face contact can hold it. By default the cloth's
+    particles are kinematic but active (mass 0: infinite mass, still colliding), so under gravity the
+    box comes to rest on the cloth when something holds it. ``box_inertia`` overrides the solid
+    box's inertia with an isotropic one [kg m^2].
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
+    SolverVBD.register_custom_attributes(builder)
+    builder.add_cloth_grid(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=cells[0],
+        dim_y=cells[1],
+        cell_x=0.1,
+        cell_y=0.1,
+        mass=particle_mass,
+        tri_ke=0.0,
+        tri_ka=0.0,
+        tri_kd=0.0,
+        edge_ke=0.0,
+        particle_radius=0.003,
+    )
+    body = builder.add_body(
+        xform=wp.transform(p=wp.vec3(box_xy[0], box_xy[1], box_bottom + box_half[2]), q=wp.quat_identity()),
+        mass=box_mass,
+        # Solid-box inertia about the centre: m / 3 * (sum of the other two half extents squared).
+        inertia=wp.mat33(
+            np.eye(3) * box_inertia
+            if box_inertia is not None
+            else np.diag(
+                [
+                    box_mass / 3.0 * (box_half[1] ** 2 + box_half[2] ** 2),
+                    box_mass / 3.0 * (box_half[0] ** 2 + box_half[2] ** 2),
+                    box_mass / 3.0 * (box_half[0] ** 2 + box_half[1] ** 2),
+                ]
+            )
+        ),
+    )
+    builder.body_qd[body] = wp.spatial_vector(*box_velocity, 0.0, 0.0, 0.0)
+    builder.add_shape_box(
+        body, hx=box_half[0], hy=box_half[1], hz=box_half[2], cfg=newton.ModelBuilder.ShapeConfig(mu=mu)
+    )
+    return builder, body
+
+
+def _finalize_pad_cloth(builder: newton.ModelBuilder, world_count: int = 1, device="cpu") -> newton.Model:
+    if world_count > 1:
+        multi = newton.ModelBuilder(gravity=builder.gravity)
+        SolverVBD.register_custom_attributes(multi)
+        for world_index in range(world_count):
+            multi.add_world(builder, xform=wp.transform(p=wp.vec3(float(world_index), 0.0, 0.0), q=wp.quat_identity()))
+        builder = multi
+    builder.color()
+    model = builder.finalize(device=device)
+    model.particle_mu = 1.0
+    model.soft_contact_ke = 0.0
+    model.soft_contact_kd = 0.0
+    return model
+
+
+def _pad_cloth_solver(
+    model: newton.Model,
+    *,
+    full_surface: bool,
+    cloth_solver: str = "semi",
+    redundancy_tolerance: float | None = 5.0e-4,
+    iterations: int = 8,
+) -> SolverCoupledADMM:
+    bodies = list(range(model.body_count))
+    particles = list(range(model.particle_count))
+
+    def make_cloth(view):
+        if cloth_solver == "vbd":
+            return SolverVBD(view, iterations=10)
+        return SolverSemiImplicit(view, enable_tri_contact=False)
+
+    return SolverCoupledADMM(
+        model,
+        [
+            SolverCoupled.Entry("box", lambda view: SolverSemiImplicit(view, enable_tri_contact=False), bodies=bodies),
+            SolverCoupled.Entry("cloth", make_cloth, particles=particles),
+        ],
+        SolverCoupledADMM.Config(
+            iterations=iterations,
+            rho=50.0,
+            gamma=0.0,
+            baumgarte=0.01,
+            full_surface_redundancy_tolerance=redundancy_tolerance,
+            contact_pairs=[SolverCoupledADMM.ContactPair("box", "cloth", full_surface=full_surface)],
+        ),
+    )
+
+
+def _step_pad_cloth(solver, model, n_steps: int, dt: float = 1.0 / 600.0, observe=None):
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+        if observe is not None:
+            observe(state_0)
+    return state_0
+
+
+def _system_momentum(model: newton.Model, state) -> tuple[np.ndarray, float]:
+    """Linear momentum [kg m/s] and kinetic energy [J] of every body and particle."""
+    pm = model.particle_mass.numpy()
+    pv = state.particle_qd.numpy()
+    bm = model.body_mass.numpy()
+    qd = state.body_qd.numpy()
+    bv, bw = qd[:, :3], qd[:, 3:]
+    inertia = model.body_inertia.numpy()
+    rot = [np.array(wp.quat_to_matrix(wp.quat(*q[3:7]))).reshape(3, 3) for q in state.body_q.numpy()]
+    p = (pm[:, None] * pv).sum(axis=0) + (bm[:, None] * bv).sum(axis=0)
+    ke = 0.5 * float((pm * (pv * pv).sum(axis=1)).sum()) + 0.5 * float((bm * (bv * bv).sum(axis=1)).sum())
+    for b in range(len(bm)):
+        world_inertia = rot[b] @ inertia[b] @ rot[b].T
+        ke += 0.5 * float(bw[b] @ world_inertia @ bw[b])
+    return p, ke
+
+
+class TestAdmmFullSurfaceContact(unittest.TestCase):
+    """Edge/face rigid-soft ADMM rows (``ContactPair(full_surface=True)``)."""
+
+    def test_pad_on_triangle_interior_needs_feature_rows(self):
+        """A pad whose footprint covers no cloth vertex: per-particle rows let it fall through, feature rows hold it."""
+        bottoms = {}
+        for full_surface in (False, True):
+            builder, body = _pad_cloth_world()
+            model = _finalize_pad_cloth(builder)
+            solver = _pad_cloth_solver(model, full_surface=full_surface)
+            state = _step_pad_cloth(solver, model, 300)
+            cloth_z = float(state.particle_q.numpy()[:, 2].mean())
+            bottoms[full_surface] = float(state.body_q.numpy()[body, 2]) - _PAD_HALF[2] - cloth_z
+            if full_surface:
+                group = solver._admm_dynamic_ef_contact_groups[0]
+                self.assertGreater(int(group.active_count_max.numpy()[0]), 0)
+                self.assertEqual(solver._admm_dynamic_rp_contact_groups[0].active_count_max.numpy()[0], 0)
+            else:
+                self.assertEqual(solver._admm_dynamic_ef_contact_groups, [])
+        # Without feature rows the pad falls through the cloth plane (free fall for 0.5 s is 1.25 m).
+        self.assertLess(bottoms[False], -0.5)
+        # With them it rests on the cloth's contact shell (radius 3 mm), within a millimetre.
+        self.assertGreater(bottoms[True], 0.002)
+        self.assertLess(bottoms[True], 0.0045)
+
+    def test_feature_records_cover_edges_and_faces(self):
+        """A pad across an interior cloth edge yields edge rows (two corners) as well as face rows."""
+        builder, body = _pad_cloth_world(
+            box_xy=(0.1, 0.05),
+            cells=(2, 1),
+            box_bottom=0.001,
+            gravity=0.0,
+            particle_mass=1.0,
+            box_velocity=(0, 0, -0.05),
+        )
+        del body
+        model = _finalize_pad_cloth(builder)
+        solver = _pad_cloth_solver(model, full_surface=True, redundancy_tolerance=None, cloth_solver="vbd")
+        _step_pad_cloth(solver, model, 30)
+        group = solver._admm_dynamic_ef_contact_groups[0]
+        n = int(group.active_count.numpy()[0])
+        corners = group.corners.numpy()[:n]
+        bary = group.bary.numpy()[:n]
+        self.assertGreater(int((corners[:, 2] < 0).sum()), 0)  # edge rows
+        self.assertGreater(int((corners[:, 2] >= 0).sum()), 0)  # face rows
+        np.testing.assert_allclose(bary.sum(axis=1), 1.0, atol=1.0e-5)
+
+    def test_force_is_distributed_by_barycentric_weight(self):
+        """``J^T f``: corner ``a`` receives ``w_a f``; the body receives ``-f`` and its torque about the COM."""
+        from newton._src.solvers.coupled.admm_feature_contact import (  # noqa: PLC0415
+            contact_ef_accumulate_forces_kernel,
+        )
+
+        device = "cpu"
+        bary = np.array([0.2, 0.5, 0.3], dtype=np.float32)
+        lam = np.array([0.1, -0.2, 0.7], dtype=np.float32)
+        u = np.array([0.0, 0.0, 0.05], dtype=np.float32)
+        jv = np.array([0.01, 0.0, -0.02], dtype=np.float32)
+        W, rho = 0.3, 50.0
+        point = np.array([0.01, -0.02, 0.005], dtype=np.float32)
+        com = np.array([0.0, 0.0, 0.001], dtype=np.float32)
+        particle_f = wp.zeros(4, dtype=wp.vec3, device=device)
+        body_f = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        wp.launch(
+            contact_ef_accumulate_forces_kernel,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=int, device=device),
+                wp.array([0], dtype=int, device=device),
+                wp.array([point], dtype=wp.vec3, device=device),
+                wp.array([wp.vec3i(3, 1, 2)], dtype=wp.vec3i, device=device),
+                wp.array([bary], dtype=wp.vec3, device=device),
+                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                wp.array([com], dtype=wp.vec3, device=device),
+                rho,
+                wp.array([W], dtype=float, device=device),
+                wp.array([lam], dtype=wp.vec3, device=device),
+                wp.array([u], dtype=wp.vec3, device=device),
+                wp.array([jv], dtype=wp.vec3, device=device),
+            ],
+            outputs=[body_f, particle_f],
+            device=device,
+        )
+        f = W * (lam + rho * W * (u - jv))
+        pf = particle_f.numpy()
+        np.testing.assert_allclose(pf[3], bary[0] * f, rtol=1e-6)
+        np.testing.assert_allclose(pf[1], bary[1] * f, rtol=1e-6)
+        np.testing.assert_allclose(pf[2], bary[2] * f, rtol=1e-6)
+        np.testing.assert_allclose(pf[0], 0.0)
+        bf = body_f.numpy()[0]
+        np.testing.assert_allclose(bf[:3], -f, rtol=1e-6)
+        np.testing.assert_allclose(bf[3:], np.cross(point - com, -f), rtol=1e-5, atol=1e-9)
+        np.testing.assert_allclose(pf.sum(axis=0) + bf[:3], 0.0, atol=1e-7)
+
+    def test_momentum_and_energy(self):
+        """A free pad hitting a free triangle interior: linear momentum is kept, kinetic energy does not grow."""
+        builder, body = _pad_cloth_world(gravity=0.0, particle_mass=0.01, box_velocity=(0.0, -0.05, -0.2), mu=0.5)
+        model = _finalize_pad_cloth(builder)
+        solver = _pad_cloth_solver(model, full_surface=True, cloth_solver="semi")
+        state_0 = model.state()
+        p0, ke0 = _system_momentum(model, state_0)
+        rows = []
+        state = _step_pad_cloth(
+            solver,
+            model,
+            120,
+            observe=lambda s: rows.append(int(solver._admm_dynamic_ef_contact_groups[0].active_count.numpy()[0])),
+        )
+        p1, ke1 = _system_momentum(model, state)
+        self.assertGreater(max(rows), 0)
+        np.testing.assert_allclose(p1, p0, atol=1.0e-6 * np.linalg.norm(p0))
+        self.assertLessEqual(ke1, ke0 * (1.0 + 1.0e-6))
+        # The pad's momentum went into the cloth: the contact acted.
+        self.assertGreater(float(state.body_qd.numpy()[body, 2]), -0.2 + 0.01)
+
+    def test_flat_contact_is_left_to_particle_rows(self):
+        """A flat plate over every vertex of a cloth: the redundancy filter drops the implied edge/face records.
+
+        Unfiltered, the same contact also gets an edge and a face row per feature, which adds rows (and
+        ADMM gain) on the same constraint. The plate moves down into a light, free VBD cloth.
+        """
+        counts = {}
+        for tolerance in (5.0e-4, None):
+            builder, body = _pad_cloth_world(
+                box_xy=(0.1, 0.1),
+                cells=(2, 2),
+                box_bottom=0.004,
+                box_half=(0.15, 0.15, 0.01),
+                gravity=0.0,
+                particle_mass=0.001,
+                box_velocity=(0.0, 0.0, -0.05),
+            )
+            model = _finalize_pad_cloth(builder)
+            solver = _pad_cloth_solver(model, full_surface=True, redundancy_tolerance=tolerance, cloth_solver="vbd")
+            lowest_clearance = []
+
+            def observe(state, body=body, lowest_clearance=lowest_clearance):
+                bottom = float(state.body_q.numpy()[body, 2]) - 0.01
+                lowest_clearance.append(bottom - float(state.particle_q.numpy()[:, 2].max()))
+
+            _step_pad_cloth(solver, model, 120, observe=observe)
+            group = solver._admm_dynamic_ef_contact_groups[0]
+            counts[tolerance] = int(group.active_count_max.numpy()[0])
+            self.assertGreater(int(solver._admm_dynamic_rp_contact_groups[0].active_count_max.numpy()[0]), 0)
+            # The plate pushes the cloth ahead of it: no particle centre gets closer than ~2 mm (radius 3 mm).
+            self.assertGreater(min(lowest_clearance), 0.002)
+        self.assertEqual(counts[5.0e-4], 0)
+        self.assertGreater(counts[None], 0)
+
+    def test_feature_candidates_are_world_local(self):
+        """N worlds: N times the single-world candidates, and every world reproduces the single world."""
+        finals = {}
+        for world_count in (1, 3):
+            # A rotationally stiff pad (as on a finger): a solid pad rocks on its contact points and
+            # magnifies the float32 rounding of the offset worlds, which is not what this test measures.
+            builder, _ = _pad_cloth_world(box_inertia=1.0e-4)
+            model = _finalize_pad_cloth(builder, world_count=world_count)
+            solver = _pad_cloth_solver(model, full_surface=True)
+            group = solver._admm_dynamic_ef_contact_groups[0]
+            finals[world_count] = (group.pair_count, _step_pad_cloth(solver, model, 120).body_q.numpy())
+        pairs_1, q_1 = finals[1]
+        pairs_3, q_3 = finals[3]
+        self.assertEqual(pairs_3, 3 * pairs_1)
+        # World 0 shares the single world's coordinates and candidate order: bit-identical.
+        np.testing.assert_array_equal(q_3[0], q_1[0])
+
+        # Worlds 1 and 2 sit 1 and 2 m away, where float32 rounds their coordinates differently; the resting
+        # contact amplifies that to micrometres. Their box corners stay within 0.1 mm of the single world's.
+        def corners(q, offset):
+            rot = np.array(wp.quat_to_matrix(wp.quat(*q[3:7]))).reshape(3, 3)
+            signs = np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)], dtype=np.float64)
+            return (signs * np.array(_PAD_HALF)) @ rot.T + q[:3] - np.array([offset, 0.0, 0.0])
+
+        for world_index in (1, 2):
+            deviation = np.abs(corners(q_3[world_index], world_index) - corners(q_1[0], 0.0)).max()
+            self.assertLess(deviation, 1.0e-4)
+
+    def test_masked_reset_clears_selected_world_feature_history(self):
+        builder, _ = _pad_cloth_world()
+        model = _finalize_pad_cloth(builder, world_count=2)
+        solver = _pad_cloth_solver(model, full_surface=True)
+        state = _step_pad_cloth(solver, model, 60)
+        group = solver._admm_dynamic_ef_contact_groups[0]
+        n = int(group.active_count.numpy()[0])
+        self.assertGreater(n, 0)
+        world_of_row = model.particle_world.numpy()[group.particle_ids.numpy()[:n]]
+        self.assertEqual(set(world_of_row.tolist()), {0, 1})
+        solver.reset(state, world_mask=wp.array([True, False, False], dtype=wp.bool, device=model.device))
+        lam = np.linalg.norm(group.lambda_.numpy()[:n], axis=1)
+        self.assertTrue(np.all(lam[world_of_row == 0] == 0.0))
+        self.assertTrue(np.any(lam[world_of_row == 1] > 0.0))
+
+    def test_flag_off_builds_no_feature_rows(self):
+        builder, _ = _pad_cloth_world()
+        model = _finalize_pad_cloth(builder)
+        solver = _pad_cloth_solver(model, full_surface=False)
+        self.assertEqual(solver._admm_dynamic_ef_contact_groups, [])
+        self.assertFalse(SolverCoupledADMM.ContactPair("a", "b").full_surface)
+
+    def test_rejects_gamma_with_full_surface(self):
+        builder, _ = _pad_cloth_world()
+        model = _finalize_pad_cloth(builder)
+        with self.assertRaisesRegex(ValueError, "gamma"):
+            SolverCoupledADMM(
+                model,
+                [
+                    SolverCoupled.Entry("box", SolverSemiImplicit, bodies=[0]),
+                    SolverCoupled.Entry("cloth", SolverVBD, particles=list(range(model.particle_count))),
+                ],
+                SolverCoupledADMM.Config(
+                    gamma=0.1, contact_pairs=[SolverCoupledADMM.ContactPair("box", "cloth", full_surface=True)]
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "full_surface_redundancy_tolerance"):
+            SolverCoupledADMM._validate_config(SolverCoupledADMM.Config(full_surface_redundancy_tolerance=-1.0))
+
+    def test_rejects_full_surface_without_rigid_particle_interface(self):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for x in (0.0, 0.1):
+            builder.add_particle(pos=(x, 0.0, 0.0), vel=wp.vec3(), mass=0.01, radius=0.01)
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "full_surface=True"):
+            SolverCoupledADMM(
+                model,
+                [
+                    SolverCoupled.Entry("a", SolverSemiImplicit, particles=[0]),
+                    SolverCoupled.Entry("b", SolverSemiImplicit, particles=[1]),
+                ],
+                SolverCoupledADMM.Config(contact_pairs=[SolverCoupledADMM.ContactPair("a", "b", full_surface=True)]),
+            )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
+    def test_feature_rows_are_graph_capturable(self):
+        """Captured steps match eager steps (same device, same scene)."""
+        device = "cuda:0"
+        results = []
+        for capture in (False, True):
+            builder, body = _pad_cloth_world(box_bottom=0.004)
+            model = _finalize_pad_cloth(builder, device=device)
+            solver = _pad_cloth_solver(model, full_surface=True)
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            dt = 1.0 / 600.0
+
+            def step(s0, s1, solver=solver, control=control, dt=dt):
+                s0.clear_forces()
+                solver.step(s0, s1, control, contacts=None, dt=dt)
+                s1.clear_forces()
+                solver.step(s1, s0, control, contacts=None, dt=dt)
+
+            step(state_0, state_1)  # warm up (module loads, allocations)
+            graph = None
+            if capture:
+                with wp.ScopedCapture(device=device) as cap:
+                    step(state_0, state_1)
+                graph = cap.graph
+            for _ in range(60):
+                if graph is not None:
+                    wp.capture_launch(graph)
+                else:
+                    step(state_0, state_1)
+            wp.synchronize_device(device)
+            group = solver._admm_dynamic_ef_contact_groups[0]
+            self.assertGreater(int(group.active_count_max.numpy()[0]), 0)
+            results.append(state_0.body_q.numpy()[body])
+        # Eager runs 61 double steps after warm-up, the captured run 1 eager + 60 replays.
+        np.testing.assert_allclose(results[1], results[0], atol=1.0e-5)
+
+
 if __name__ == "__main__":
     unittest.main()

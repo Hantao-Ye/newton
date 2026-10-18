@@ -290,6 +290,22 @@ as ``shape_material_mu`` and ``Model.particle_mu`` at row-fill time; it is not a
 ``ContactPair`` field. Contact rows use an isotropic Coulomb
 maximum-dissipation projection. They do not solve cone complementarity directly.
 
+Particle-shape rows exist only where a particle's contact sphere touches a shape,
+so a thin rigid feature can pass between the particles of a coarse soft mesh
+(a gripper pad through a cloth cell). ``ContactPair(..., full_surface=True)``
+also couples the pair's shapes to the edges and triangle interiors of the
+particle entry's mesh: the coupler runs the collision pipeline's edge/face
+passes (see ``enable_rigid_soft_full_surface_contact``) on its own candidates
+and turns each record into a row whose impulse is distributed over the
+feature's particles by barycentric weight. Only shapes that can generate
+full-surface contact take part (analytic primitives, infinite planes, and
+mesh/convex shapes with an SDF); the others keep particle rows and are named in
+a warning. Records already implied by the particles' own rows (a flat shape face
+over the feature) are dropped within
+``Config.full_surface_redundancy_tolerance``, so flat contact keeps the particle
+rows alone; ``None`` keeps every record. Full-surface pairs require
+``gamma == 0``.
+
 ADMM contact buffers are fixed-capacity device arrays. Persistent contacts
 warm-start local variables and dual variables by stable contact keys across
 steps. The particle-particle stream is contacts-like and hash-grid based, but it
